@@ -17,11 +17,15 @@ use super::*;
 
 mod query;
 mod reg;
+mod sync_manager;
 mod xfer;
+mod xfer_dlist_handle;
 
 pub use query::{QueryResponse, QueryResponseIterator, QueryResponseList};
-pub use reg::RegDescList;
-pub use xfer::XferDescList;
+pub use reg::{RegDescList, RegDescriptor};
+pub use sync_manager::{BackendSyncable, SyncManager};
+pub use xfer::{XferDescList, XferDescriptor};
+pub use xfer_dlist_handle::XferDlistHandle;
 
 /// Memory types supported by NIXL
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

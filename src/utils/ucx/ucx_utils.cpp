@@ -26,6 +26,12 @@
 
 #include <nixl_types.h>
 
+extern "C" {
+#ifdef HAVE_UCX_GPU_DEVICE_API
+#include <ucp/api/device/ucp_host.h>
+#endif
+}
+
 #include "common/nixl_log.h"
 #include "config.h"
 #include "serdes/serdes.h"
@@ -58,6 +64,8 @@ nixl_status_t ucx_status_to_nixl(ucs_status_t status)
         return NIXL_ERR_REMOTE_DISCONNECT;
     case UCS_ERR_INVALID_PARAM:
         return NIXL_ERR_INVALID_PARAM;
+    case UCS_ERR_CANCELED:
+        return NIXL_ERR_CANCELED;
     default:
         NIXL_WARN << "Unexpected UCX error: " << ucs_status_string(status);
         return NIXL_ERR_BACKEND;
@@ -228,22 +236,52 @@ nixl_status_t nixlUcxEp::disconnect_nb()
  * Active message handling
  * =========================================== */
 
-nixl_status_t nixlUcxEp::sendAm(unsigned msg_id,
-                                void* hdr, size_t hdr_len,
-                                void* buffer, size_t len,
-                                uint32_t flags, nixlUcxReq &req)
-{
-    ucs_status_ptr_t request;
+using nixl_ucx_am_cb_ctx_t = std::pair<void *, nixlUcxEp::am_deleter_t>;
+using nixl_ucx_am_cb_ctx_ptr_t = std::unique_ptr<nixl_ucx_am_cb_ctx_t>;
+
+void
+nixlUcxEp::sendAmCallback(void *request, ucs_status_t status, void *user_data) {
+    auto ctx = static_cast<nixl_ucx_am_cb_ctx_t *>(user_data);
+    ctx->second(request, ctx->first);
+    delete ctx;
+}
+
+nixl_status_t
+nixlUcxEp::sendAm(unsigned msg_id,
+                  void *hdr,
+                  size_t hdr_len,
+                  void *buffer,
+                  size_t len,
+                  uint32_t flags,
+                  nixlUcxReq *req,
+                  am_deleter_t deleter) {
+    nixl_status_t status = checkTxState();
+    if (status != NIXL_SUCCESS) {
+        return status;
+    }
+
     ucp_request_param_t param = {0};
 
     param.op_attr_mask |= UCP_OP_ATTR_FIELD_FLAGS;
     param.flags         = flags;
 
-    request = ucp_am_send_nbx(eph, msg_id, hdr, hdr_len, buffer, len, &param);
+    nixl_ucx_am_cb_ctx_ptr_t ctx;
+    if (deleter) {
+        ctx = std::make_unique<nixl_ucx_am_cb_ctx_t>(buffer, deleter);
+        param.op_attr_mask |= UCP_OP_ATTR_FIELD_CALLBACK | UCP_OP_ATTR_FIELD_USER_DATA;
+        param.cb.send = sendAmCallback;
+        param.user_data = ctx.get();
+    }
 
+    ucs_status_ptr_t request = ucp_am_send_nbx(eph, msg_id, hdr, hdr_len, buffer, len, &param);
     if (UCS_PTR_IS_PTR(request)) {
-        req = (void*)request;
+        ctx.release();
+        if (req != nullptr) {
+            *req = static_cast<nixlUcxReq>(request);
+        }
         return NIXL_IN_PROG;
+    } else if (deleter) {
+        deleter(nullptr, buffer);
     }
 
     return ucx_status_to_nixl(UCS_PTR_STATUS(request));
@@ -369,12 +407,9 @@ bool nixlUcxMtLevelIsSupported(const nixl_ucx_mt_t mt_type) noexcept
 
 nixlUcxContext::nixlUcxContext(std::vector<std::string> devs,
                                size_t req_size,
-                               nixlUcxContext::req_cb_t init_cb,
-                               nixlUcxContext::req_cb_t fini_cb,
                                bool prog_thread,
                                unsigned long num_workers,
-                               nixl_thread_sync_t sync_mode)
-{
+                               nixl_thread_sync_t sync_mode) {
     ucp_params_t ucp_params;
 
     // With strict synchronization model nixlAgent serializes access to backends, with more
@@ -386,6 +421,10 @@ nixlUcxContext::nixlUcxContext(std::vector<std::string> devs,
 
     ucp_params.field_mask = UCP_PARAM_FIELD_FEATURES | UCP_PARAM_FIELD_MT_WORKERS_SHARED;
     ucp_params.features = UCP_FEATURE_RMA | UCP_FEATURE_AMO32 | UCP_FEATURE_AMO64 | UCP_FEATURE_AM;
+#ifdef HAVE_UCX_GPU_DEVICE_API
+    ucp_params.features |= UCP_FEATURE_DEVICE;
+#endif
+
     if (prog_thread)
         ucp_params.features |= UCP_FEATURE_WAKEUP;
     ucp_params.mt_workers_shared = num_workers > 1 ? 1 : 0;
@@ -393,16 +432,6 @@ nixlUcxContext::nixlUcxContext(std::vector<std::string> devs,
     if (req_size) {
         ucp_params.request_size = req_size;
         ucp_params.field_mask |= UCP_PARAM_FIELD_REQUEST_SIZE;
-    }
-
-    if (init_cb) {
-        ucp_params.request_init = init_cb;
-        ucp_params.field_mask |= UCP_PARAM_FIELD_REQUEST_INIT;
-    }
-
-    if (fini_cb) {
-        ucp_params.request_cleanup = fini_cb;
-        ucp_params.field_mask |= UCP_PARAM_FIELD_REQUEST_CLEANUP;
     }
 
     nixl::ucx::config config;
@@ -584,6 +613,34 @@ void nixlUcxContext::memDereg(nixlUcxMem &mem)
     ucp_mem_unmap(ctx, mem.memh);
 }
 
+#ifndef HAVE_UCX_GPU_DEVICE_API
+namespace {
+constexpr std::string_view ucxGpuDeviceApiUnsupported{
+    "UCX was not compiled with GPU device API support"};
+}
+#endif
+
+
+
+size_t
+nixlUcxContext::getGpuSignalSize() const {
+#ifdef HAVE_UCX_GPU_DEVICE_API
+    ucp_context_attr_t attr;
+    attr.field_mask = UCP_ATTR_FIELD_DEVICE_COUNTER_SIZE;
+    ucs_status_t query_status = ucp_context_query(ctx, &attr);
+
+    if (query_status != UCS_OK) {
+        throw std::runtime_error(
+            std::string("Failed to query UCX context for device counter size: ") +
+            ucs_status_string(query_status));
+    }
+
+    return attr.device_counter_size;
+#else
+    throw std::runtime_error(std::string(ucxGpuDeviceApiUnsupported));
+#endif
+}
+
 /* ===========================================
  * Active message handling
  * =========================================== */
@@ -629,7 +686,7 @@ nixl_status_t nixlUcxWorker::test(nixlUcxReq req)
 
 void nixlUcxWorker::reqRelease(nixlUcxReq req)
 {
-    ucp_request_free((void*)req);
+    ucp_request_free(req);
 }
 
 void nixlUcxWorker::reqCancel(nixlUcxReq req)
@@ -653,4 +710,27 @@ nixlUcxWorker::getEfd() const {
         throw std::runtime_error(err_str);
     }
     return fd;
+}
+
+void
+nixlUcxWorker::prepGpuSignal([[maybe_unused]] const nixlUcxMem &mem,
+                             [[maybe_unused]] void *signal) const {
+#ifdef HAVE_UCX_GPU_DEVICE_API
+    if (!signal) {
+        throw std::invalid_argument("Signal pointer cannot be null");
+    }
+
+    ucp_device_counter_params_t params;
+    params.field_mask = UCP_DEVICE_COUNTER_PARAMS_FIELD_MEMH;
+    params.memh = mem.memh;
+
+    ucs_status_t status = ucp_device_counter_init(worker.get(), &params, signal);
+
+    if (status != UCS_OK) {
+        throw std::runtime_error(std::string("Failed to initialize GPU signal: ") +
+                                 ucs_status_string(status));
+    }
+#else
+    throw std::runtime_error(std::string(ucxGpuDeviceApiUnsupported));
+#endif
 }

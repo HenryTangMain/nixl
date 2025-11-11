@@ -19,12 +19,14 @@
 #define __UTILS_H
 
 #include "config.h"
+#include <chrono>
 #include <cstdint>
 #include <iostream>
 #include <string>
 #include <variant>
 #include <vector>
 #include <optional>
+#include <utils/common/nixl_time.h>
 #include "runtime/runtime.h"
 
 #if HAVE_CUDA
@@ -55,7 +57,6 @@
 // TODO: This is true for CX-7, need support for other CX cards and NVLink
 #define MAXBW 50.0 // 400 Gbps or 50 GB/sec
 #define LARGE_BLOCK_SIZE (1LL * (1 << 20))
-#define MIN_WARMUP_ITERS 8
 
 #define XFERBENCH_INITIATOR_BUFFER_ELEMENT 0xbb
 #define XFERBENCH_TARGET_BUFFER_ELEMENT 0xaa
@@ -65,17 +66,20 @@
 
 // Backend types
 #define XFERBENCH_BACKEND_UCX "UCX"
-#define XFERBENCH_BACKEND_UCX_MO "UCX_MO"
+#define XFERBENCH_BACKEND_LIBFABRIC "LIBFABRIC"
 #define XFERBENCH_BACKEND_GDS "GDS"
+#define XFERBENCH_BACKEND_GDS_MT "GDS_MT"
 #define XFERBENCH_BACKEND_POSIX "POSIX"
 #define XFERBENCH_BACKEND_GPUNETIO "GPUNETIO"
 #define XFERBENCH_BACKEND_MOONCAKE "Mooncake"
 #define XFERBENCH_BACKEND_HF3FS "HF3FS"
 #define XFERBENCH_BACKEND_OBJ "OBJ"
+#define XFERBENCH_BACKEND_GUSLI "GUSLI"
 
 // POSIX API types
 #define XFERBENCH_POSIX_API_AIO "AIO"
 #define XFERBENCH_POSIX_API_URING "URING"
+#define XFERBENCH_POSIX_API_POSIXAIO "POSIXAIO"
 
 // OBJ S3 scheme types
 #define XFERBENCH_OBJ_SCHEME_HTTP "http"
@@ -108,6 +112,7 @@
 // Segment types
 #define XFERBENCH_SEG_TYPE_DRAM "DRAM"
 #define XFERBENCH_SEG_TYPE_VRAM "VRAM"
+#define XFERBENCH_SEG_TYPE_BLK "BLK"
 
 // Worker types
 #define XFERBENCH_WORKER_NIXL     "nixl"
@@ -140,6 +145,7 @@ class xferBenchConfig {
         static int warmup_iter;
         static int num_threads;
         static bool enable_pt;
+        static size_t progress_threads;
         static std::string device_list;
         static std::string etcd_endpoints;
         static std::string benchmark_group;
@@ -150,7 +156,9 @@ class xferBenchConfig {
         static bool storage_enable_direct;
         static int gds_batch_pool_size;
         static int gds_batch_limit;
+        static int gds_mt_num_threads;
         static std::string gpunetio_device_list;
+        static std::string gpunetio_oob_list;
         static long page_size;
         static std::string obj_access_key;
         static std::string obj_secret_key;
@@ -161,14 +169,98 @@ class xferBenchConfig {
         static bool obj_use_virtual_addressing;
         static std::string obj_endpoint_override;
         static std::string obj_req_checksum;
+        static std::string obj_ca_bundle;
+        static int hf3fs_iopool_size;
+        static std::string gusli_client_name;
+        static int gusli_max_simultaneous_requests;
+        static std::string gusli_config_file;
+        static uint64_t gusli_bdev_byte_offset;
+        static std::string gusli_device_security;
 
-        static int loadFromFlags();
-        static void printConfig();
+        static int
+        loadFromFlags();
         static void
-        printOption (const std::string &desc, const std::string &value);
-        static std::vector<std::string> parseDeviceList();
+        printConfig();
+        static void
+        printOption(const std::string &desc, const std::string &value);
+        static void
+        printSeparator(const char sep = '-');
+        static std::vector<std::string>
+        parseDeviceList();
         static bool
         isStorageBackend();
+};
+
+// Shared GUSLI device config used by utils and nixl_worker
+struct GusliDeviceConfig {
+    int device_id;
+    char device_type; // 'F' for file, 'K' for kernel device, 'N' for networked server
+    std::string device_path;
+    std::string security_flags;
+};
+
+// Parser for GUSLI device list: "id:type:path,id:type:path,..."
+// security_list: comma-separated security flags; num_devices: expected device count (validation)
+std::vector<GusliDeviceConfig>
+parseGusliDeviceList(const std::string &device_list,
+                     const std::string &security_list,
+                     int num_devices);
+
+// Timer class for measuring durations at high resolution
+class xferBenchTimer {
+public:
+    xferBenchTimer();
+
+    // Return the elapsed time in microseconds
+    nixlTime::us_t
+    lap();
+
+private:
+    nixlTime::us_t start_;
+};
+
+// Stats class for measuring arbitrary numeric metrics with multiple samples
+class xferMetricStats {
+public:
+    double
+    min() const;
+    double
+    max() const;
+    double
+    avg() const;
+    double
+    p90();
+    double
+    p95();
+    double
+    p99();
+
+    void
+    add(double value);
+    void
+    add(const xferMetricStats &other);
+    void
+    reserve(size_t n);
+    void
+    clear();
+
+private:
+    std::vector<double> samples;
+};
+
+// Stats class for measuring benchmark metrics
+struct xferBenchStats {
+    xferMetricStats total_duration;
+    xferMetricStats prepare_duration;
+    xferMetricStats post_duration;
+    xferMetricStats transfer_duration;
+
+    void
+    clear();
+    void
+    add(const xferBenchStats &other);
+    void
+    reserve(size_t n);
 };
 
 // Generic IOV descriptor class independent of NIXL
@@ -181,8 +273,12 @@ public:
     unsigned long long handle;
     std::string metaInfo;
 
-    xferBenchIOV(uintptr_t a, size_t l, int d) :
-        addr(a), len(l), devId(d), padded_size(len), handle(0) {}
+    xferBenchIOV(uintptr_t a, size_t l, int d)
+        : addr(a),
+          len(l),
+          devId(d),
+          padded_size(len),
+          handle(0) {}
 
     xferBenchIOV(uintptr_t a, size_t l, int d, size_t p, unsigned long long h) :
         addr(a), len(l), devId(d), padded_size(p), handle(h) {}
@@ -213,10 +309,12 @@ class xferBenchUtils {
         static bool
         rmObjS3(const std::string &name);
 
-        static void checkConsistency(std::vector<std::vector<xferBenchIOV>> &desc_lists);
-        static void printStatsHeader();
-        static void printStats(bool is_target, size_t block_size, size_t batch_size,
-			                   double total_duration);
+        static void
+        checkConsistency(std::vector<std::vector<xferBenchIOV>> &desc_lists);
+        static void
+        printStatsHeader();
+        static void
+        printStats(bool is_target, size_t block_size, size_t batch_size, xferBenchStats stats);
 };
 
 #endif // __UTILS_H

@@ -17,8 +17,19 @@
 #ifndef __TRANSFER_REQUEST_H_
 #define __TRANSFER_REQUEST_H_
 
-constexpr auto min_chrono_time = std::chrono::time_point<std::chrono::high_resolution_clock>::min();
-using chrono_point_t = std::chrono::high_resolution_clock::time_point;
+#include <string>
+#include <unordered_map>
+#include <memory>
+
+#include "nixl_types.h"
+#include "backend_engine.h"
+#include "telemetry.h"
+
+enum nixl_telemetry_stat_status_t {
+    NIXL_TELEMETRY_POST = 0,
+    NIXL_TELEMETRY_POST_AND_FINISH = 1,
+    NIXL_TELEMETRY_FINISH = 2
+};
 
 // Contains pointers to corresponding backend engine and its handler, and populated
 // and verified DescLists, and other state and metadata needed for a NIXL transfer
@@ -37,10 +48,7 @@ class nixlXferReqH {
         nixl_xfer_op_t     backendOp;
         nixl_status_t      status;
 
-        struct {
-            chrono_point_t startTime;
-            size_t totalBytes;
-        } telemetry;
+        nixl_xfer_telem_t telemetry;
 
     public:
         inline nixlXferReqH() { }
@@ -54,7 +62,8 @@ class nixlXferReqH {
         }
 
         void
-        updateRequestStats(const std::string &dbg_msg_type);
+        updateRequestStats(std::unique_ptr<nixlTelemetry> &telemetry,
+                           nixl_telemetry_stat_status_t stat_status);
 
         friend class nixlAgent;
 };

@@ -45,15 +45,13 @@ def prep_handles(agent: nixl_agent, xfer_dlist, reg_dlist, indices):
     logger.info("register_memory:\t%.4f sec", elapsed)
 
     start = time.perf_counter()
-    local_prep_handle = agent.prep_xfer_dlist(
-        "NIXL_INIT_AGENT", xfer_dlist, "DRAM", False
-    )
+    local_prep_handle = agent.prep_xfer_dlist("NIXL_INIT_AGENT", xfer_dlist, "DRAM")
     elapsed = time.perf_counter() - start
     assert local_prep_handle
     logger.info("prep_xfer_dlist INIT:\t%.4f sec", elapsed)
 
     start = time.perf_counter()
-    remote_prep_handle = agent.prep_xfer_dlist("agent", xfer_dlist, "DRAM", False)
+    remote_prep_handle = agent.prep_xfer_dlist("agent", xfer_dlist, "DRAM")
     elapsed = time.perf_counter() - start
     assert remote_prep_handle
     logger.info("prep_xfer_dlist SELF:\t%.4f sec", elapsed)
@@ -78,7 +76,7 @@ def perf_test_list(num_descs: int, addr_base: int, length: int):
     indices = list(range(num_descs))
 
     start = time.perf_counter()
-    xfer_dlist = agent.get_xfer_descs(descs_list, "DRAM", False)
+    xfer_dlist = agent.get_xfer_descs(descs_list, "DRAM")
     elapsed = time.perf_counter() - start
     assert xfer_dlist.descCount() == num_descs
     logger.info("get_xfer_descs:\t\t%.4f sec", elapsed)
@@ -87,7 +85,7 @@ def perf_test_list(num_descs: int, addr_base: int, length: int):
         (addr_base + i * length, length, 0, b"") for i in range(num_descs)
     ]
     start = time.perf_counter()
-    reg_dlist = agent.get_reg_descs(blob_descs_list, "DRAM", False)
+    reg_dlist = agent.get_reg_descs(blob_descs_list, "DRAM")
     elapsed = time.perf_counter() - start
     assert reg_dlist.descCount() == num_descs
     logger.info("get_reg_descs:\t\t%.4f sec", elapsed)
@@ -111,13 +109,13 @@ def perf_test_array(num_descs: int, addr_base: int, length: int):
     descs_np[:, 2] = 0
 
     start = time.perf_counter()
-    xfer_dlist = agent.get_xfer_descs(descs_np, "DRAM", False)
+    xfer_dlist = agent.get_xfer_descs(descs_np, "DRAM")
     elapsed = time.perf_counter() - start
     assert xfer_dlist.descCount() == num_descs
     logger.info("get_xfer_descs:\t\t%.4f sec", elapsed)
 
     start = time.perf_counter()
-    reg_dlist = agent.get_reg_descs(descs_np, "DRAM", False)
+    reg_dlist = agent.get_reg_descs(descs_np, "DRAM")
     elapsed = time.perf_counter() - start
     assert reg_dlist.descCount() == num_descs
     logger.info("get_reg_descs:\t\t%.4f sec", elapsed)
@@ -141,7 +139,10 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    logger.info("Using NIXL Plugins from:\n%s", os.environ["NIXL_PLUGIN_DIR"])
+    logger.info(
+        "Using NIXL Plugins from: %s",
+        os.environ.get("NIXL_PLUGIN_DIR", "default location"),
+    )
 
     # Example using nixl_agent_config
     agent = init_agent()

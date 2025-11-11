@@ -119,7 +119,7 @@ std::shared_ptr<const nixlPluginHandle> nixlPluginManager::loadPluginFromPath(co
     // Open the plugin file
     void* handle = dlopen(plugin_path.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (!handle) {
-        NIXL_ERROR << "Failed to load plugin from " << plugin_path << ": " << dlerror();
+        NIXL_INFO << "Failed to load plugin from " << plugin_path << ": " << dlerror();
         return nullptr;
     }
 
@@ -285,7 +285,7 @@ std::shared_ptr<const nixlPluginHandle> nixlPluginManager::loadPlugin(const std:
     }
 
     // Failed to load the plugin
-    NIXL_ERROR << "Failed to load plugin '" << plugin_name << "' from any directory";
+    NIXL_INFO << "Failed to load plugin '" << plugin_name << "' from any directory";
     return nullptr;
 }
 
@@ -390,43 +390,46 @@ const std::vector<nixlStaticPluginInfo>& nixlPluginManager::getStaticPlugins() {
     return static_plugins_;
 }
 
-void nixlPluginManager::registerBuiltinPlugins() {
-#ifdef STATIC_PLUGIN_UCX
-        extern nixlBackendPlugin* createStaticUcxPlugin();
-        registerStaticPlugin("UCX", createStaticUcxPlugin);
-#endif //STATIC_PLUGIN_UCX
+#define NIXL_REGISTER_STATIC_PLUGIN(name)                   \
+    extern nixlBackendPlugin *createStatic##name##Plugin(); \
+    registerStaticPlugin(#name, createStatic##name##Plugin);
 
-#ifdef STATIC_PLUGIN_UCX_MO
-        extern nixlBackendPlugin* createStaticUcxMoPlugin();
-        registerStaticPlugin("UCX_MO", createStaticUcxMoPlugin);
-#endif // STATIC_PLUGIN_UCX_MO
+void nixlPluginManager::registerBuiltinPlugins() {
+#ifdef STATIC_PLUGIN_LIBFABRIC
+    NIXL_REGISTER_STATIC_PLUGIN(LIBFABRIC)
+#endif
+
+#ifdef STATIC_PLUGIN_UCX
+    NIXL_REGISTER_STATIC_PLUGIN(UCX)
+#endif
 
 #ifdef STATIC_PLUGIN_GDS
 #ifndef DISABLE_GDS_BACKEND
-        extern nixlBackendPlugin* createStaticGdsPlugin();
-        registerStaticPlugin("GDS", createStaticGdsPlugin);
-#endif // DISABLE_GDS_BACKEND
-#endif // STATIC_PLUGIN_GDS
+    NIXL_REGISTER_STATIC_PLUGIN(GDS)
+#endif
+#endif
+
+#ifdef STATIC_PLUGIN_GDS_MT
+    NIXL_REGISTER_STATIC_PLUGIN(GDS_MT)
+#endif
 
 #ifdef STATIC_PLUGIN_POSIX
-        extern nixlBackendPlugin* createStaticPosixPlugin();
-        registerStaticPlugin("POSIX", createStaticPosixPlugin);
-#endif // STATIC_PLUGIN_POSIX
+    NIXL_REGISTER_STATIC_PLUGIN(POSIX)
+#endif
 
 #ifdef STATIC_PLUGIN_GPUNETIO
-#ifndef DISABLE_GPUNETIO_BACKEND
-        extern nixlBackendPlugin* createStaticGpunetioPlugin();
-        registerStaticPlugin("GPUNETIO", createStaticGpunetioPlugin);
-#endif // DISABLE_GPUNETIO_BACKEND
-#endif // STATIC_PLUGIN_GPUNETIO
+    NIXL_REGISTER_STATIC_PLUGIN(GPUNETIO)
+#endif
 
 #ifdef STATIC_PLUGIN_OBJ
-        extern nixlBackendPlugin *createStaticObjPlugin();
-        registerStaticPlugin ("OBJ", createStaticObjPlugin);
-#endif // STATIC_PLUGIN_OBJ
+    NIXL_REGISTER_STATIC_PLUGIN(OBJ)
+#endif
 
 #ifdef STATIC_PLUGIN_MOONCAKE
-        extern nixlBackendPlugin *createStaticMooncakePlugin();
-        registerStaticPlugin("MOONCAKE", createStaticMooncakePlugin);
-#endif // STATIC_PLUGIN_MOONCAKE
+    NIXL_REGISTER_STATIC_PLUGIN(MOONCAKE)
+#endif
+
+#ifdef STATIC_PLUGIN_HF3FS
+    NIXL_REGISTER_STATIC_PLUGIN(HF3FS)
+#endif
 }
