@@ -36,9 +36,10 @@ class nixlAgentData;
 /**
  * @enum   nixl_mem_t
  * @brief  An enumeration of segment types for NIXL
+ *         GAUDI_SEG for Habana Gaudi/HPU device memory
  *         FILE_SEG must be last
  */
-enum nixl_mem_t {DRAM_SEG, VRAM_SEG, BLK_SEG, OBJ_SEG, FILE_SEG};
+enum nixl_mem_t {DRAM_SEG, VRAM_SEG, BLK_SEG, OBJ_SEG, GAUDI_SEG, FILE_SEG};
 
 /**
  * @enum   nixl_xfer_op_t

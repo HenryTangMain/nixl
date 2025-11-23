@@ -588,6 +588,24 @@ int nixlUcxContext::memReg(void *addr, size_t size, nixlUcxMem &mem, nixl_mem_t 
             NIXL_WARN << "memory is detected as host, check that UCX is configured"
                          " with CUDA support";
         }
+    } else if (nixl_mem_type == nixl_mem_t::GAUDI_SEG) {
+        ucp_mem_attr_t attr;
+        attr.field_mask = UCP_MEM_ATTR_FIELD_MEM_TYPE;
+        status = ucp_mem_query(mem.memh, &attr);
+        if (status != UCS_OK) {
+            NIXL_ERROR << absl::StrFormat("Failed to ucp_mem_query for Gaudi memory: %s",
+                                          ucs_status_string(status));
+            ucp_mem_unmap(ctx, mem.memh);
+            return -1;
+        }
+
+        if (attr.mem_type == UCS_MEMORY_TYPE_HOST) {
+            NIXL_WARN << "memory is detected as host, check that UCX is configured"
+                         " with Gaudi support (ucx-gaudi)";
+        } else if (attr.mem_type != UCS_MEMORY_TYPE_GAUDI) {
+            NIXL_WARN << absl::StrFormat("memory type mismatch: expected GAUDI, got %d",
+                                          attr.mem_type);
+        }
     }
 
     return 0;

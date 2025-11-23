@@ -1128,6 +1128,7 @@ nixl_mem_list_t nixlUcxEngine::getSupportedMems () const {
     nixl_mem_list_t mems;
     mems.push_back(DRAM_SEG);
     mems.push_back(VRAM_SEG);
+    mems.push_back(GAUDI_SEG);  // Habana Gaudi/HPU memory support via ucx-gaudi
     return mems;
 }
 
