@@ -1,5 +1,5 @@
 <!--
-SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 SPDX-License-Identifier: Apache-2.0
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -199,6 +199,7 @@ For development environments or when Docker is not available.
 - **LibFabric**: Fabric communication library
 - **DOCA**: NVIDIA DOCA SDK for GPUNetIO
 - **AWS SDK C++**: For S3 object storage backend
+- **Azure SDK for C++**: For Azure Blob Storage backend
 - **GDS**: NVIDIA GPUDirect Storage
 - **GUSLI**: G3+ User Space Access Library for direct block device access
 - **NVSHMEM**: Required for NVSHMEM worker type
@@ -223,7 +224,7 @@ sudo apt-get update && sudo apt-get install -y \
   libaio-dev liburing-dev protobuf-compiler-grpc \
   libcpprest-dev etcd-server etcd-client \
   pybind11-dev libclang-dev libcurl4-openssl-dev \
-  libssl-dev uuid-dev zlib1g-dev python3-dev python3-pip
+  libssl-dev uuid-dev libxml2-dev zlib1g-dev python3-dev python3-pip
 
 # Install RDMA/InfiniBand packages
 sudo apt-get reinstall -y --no-install-recommends \
@@ -297,11 +298,24 @@ cmake ../aws-sdk-cpp/ \
 make -j$(nproc) && sudo make install
 ```
 
+**Azure SDK for C++ (for Azure Blob Storage backend):**
+```bash
+git clone --depth 1 https://github.com/Azure/azure-sdk-for-cpp.git --branch  azure-storage-blobs_12.15.0
+cd azure-sdk-for-cpp/
+mkdir build && cd build
+AZURE_SDK_DISABLE_AUTO_VCPKG=1 cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DCMAKE_INSTALL_PREFIX=/usr/local -DDISABLE_AMQP=ON -DDISABLE_AZURE_CORE_OPENTELEMETRY=ON
+cmake --build . --target azure-storage-blobs azure-identity
+cmake --install sdk/core
+cmake --install sdk/storage/azure-storage-common
+cmake --install sdk/storage/azure-storage-blobs
+cmake --install sdk/identity
+```
+
 **DOCA (Optional):**
 ```bash
 # Add Mellanox repository and install DOCA
-wget https://www.mellanox.com/downloads/DOCA/DOCA_v3.1.0/host/doca-host_3.1.0-091000-25.07-ubuntu2404_amd64.deb
-sudo dpkg -i doca-host_3.1.0-091000-25.07-ubuntu2404_amd64.deb
+wget https://www.mellanox.com/downloads/DOCA/DOCA_v3.2.0/host/doca-host_3.2.0-125000-25.10-ubuntu2404_amd64.deb -O doca-host.deb
+sudo dpkg -i doca-host.deb
 sudo apt-get update && sudo apt-get install -y doca-sdk-gpunetio libdoca-sdk-gpunetio-dev
 ```
 
@@ -418,6 +432,7 @@ sudo systemctl start etcd && sudo systemctl enable etcd
 
 #### Core Configuration
 ```
+--config_file PATH         # Configuraion file (default: NONE)
 --runtime_type NAME        # Type of runtime to use [ETCD] (default: ETCD)
 --worker_type NAME         # Worker to use to transfer data [nixl, nvshmem] (default: nixl)
 --backend NAME             # Communication backend [UCX, GDS, GDS_MT, POSIX, GPUNETIO, Mooncake, HF3FS, OBJ, GUSLI] (default: UCX)
@@ -438,6 +453,7 @@ sudo systemctl start etcd && sudo systemctl enable etcd
 --max_block_size SIZE      # Maximum block size (default: 64MiB)
 --start_batch_size SIZE    # Starting batch size (default: 1)
 --max_batch_size SIZE      # Maximum batch size (default: 1)
+--recreate_xfer            # Recreate xfer for every iteration
 ```
 
 #### Performance and Threading
@@ -459,7 +475,7 @@ sudo systemctl start etcd && sudo systemctl enable etcd
 --etcd_endpoints URL       # ETCD server URL for coordination (optional for storage backends)
 ```
 
-#### Storage Backend Options (GDS, GDS_MT, POSIX, HF3FS, OBJ)
+#### Storage Backend Options (GDS, GDS_MT, POSIX, HF3FS, OBJ, AZURE_BLOB)
 ```
 --filepath PATH            # File path for storage operations
 --num_files NUM            # Number of files used by benchmark (default: 1)
@@ -482,6 +498,8 @@ sudo systemctl start etcd && sudo systemctl enable etcd
 **POSIX Backend:**
 ```
 --posix_api_type TYPE      # API type for POSIX operations [AIO, URING, POSIXAIO] (default: AIO)
+--posix_ios_pool_size SIZE # IO pool size for POSIX operations (default: 65536)
+--posix_kernel_queue_size SIZE # Kernel queue size for AIO and URING APIs (default: 256)
 ```
 
 **GPUNETIO Backend:**
@@ -502,6 +520,13 @@ sudo systemctl start etcd && sudo systemctl enable etcd
 --obj_req_checksum TYPE    # Required checksum for S3 backend [supported, required] (default: supported)
 ```
 
+**AZURE_BLOB Backend:**
+```
+--azure_blob_account_url ACCOUNT_URL              # Account URL for Azure Blob backend
+--azure_blob_container_name CONTAINER_NAME        # Container name for Azure Blob backend
+--azure_blob_connection_string CONNECTION_STRING  # Connection string for Azure Blob backend
+```
+
 **GUSLI Backend:**
 ```
 --device_list LIST                     # Device specs in format 'id:type:path' (e.g., '11:F:./store0.bin,27:K:/dev/nvme0n1')
@@ -509,11 +534,39 @@ sudo systemctl start etcd && sudo systemctl enable etcd
 --gusli_client_name NAME               # Client identifier (default: NIXLBench)
 --gusli_max_simultaneous_requests NUM  # Concurrent request limit (default: 32)
 --gusli_device_security LIST           # Comma-separated security flags per device (e.g., 'sec=0x3,sec=0x71')
---gusli_bdev_byte_offset BYTES         # Starting LBA offset in bytes (default: 1048576)
+--gusli_device_byte_offsets LIST       # Comma-separated LBA offset in bytes per device (default: 1048576)
 --gusli_config_file CONTENT            # Custom config file content (auto-generated if not provided)
 
 Note: storage_enable_direct is automatically enabled for GUSLI backend
 ```
+
+### Configuration File
+
+The name of a config file can be specified using the `--config_file` command line parameter. The config file is in TOML format.
+
+Each existing command-line parameter can also be placed in the global scope (no sections) of the configuration file, so the following invocations:
+
+```
+nixlbench --etcd_endpoints http://localhost:2379 --backend POSIX --filepath /mnt/test --posix_api_type AIO --max_block_size 2097152
+```
+and
+
+```
+nixlbench --config_file /tmp/nixlbench.config
+```
+
+where `/tmp/nixlbench.config` contains:
+
+```
+etcd_endpoints="http://localhost:2379"
+backend="POSIX"
+filepath="/mnt/test"
+posix_api_type="AIO"
+max_block_size=2097152
+``
+are identical.
+
+If a parameter exists in the config file and is also explicitly specified on the command line, the latter takes precedence.
 
 ### Using ETCD for Coordination
 
@@ -528,6 +581,7 @@ NIXL Benchmark uses an ETCD key-value store for coordination between benchmark w
 
 1. Ensure ETCD server is running (e.g., `docker run -p 2379:2379 quay.io/coreos/etcd`
 2. Launch multiple nixlbench instances pointing to the same ETCD server
+3. Multiple instances should be launched within the default timeout of 60s.
 
 **For single-instance storage benchmarks:**
 ```bash
@@ -538,12 +592,7 @@ NIXL Benchmark uses an ETCD key-value store for coordination between benchmark w
 ./nixlbench --etcd_endpoints http://etcd-server:2379 --backend GDS --filepath /mnt/storage/testfile
 ```
 
-Note: etcd can be installed directly on host as well:
-```bash
-apt install etcd-server
-```
-
-Example:
+**For multi-instance storage benchmarks where ETCD is required:**
 ```bash
 # On host 1
 ./nixlbench --etcd_endpoints http://etcd-server:2379 --backend UCX --initiator_seg_type VRAM --target_seg_type VRAM
@@ -551,8 +600,7 @@ Example:
 # On host 2
 ./nixlbench --etcd_endpoints http://etcd-server:2379 --backend UCX --initiator_seg_type VRAM --target_seg_type VRAM
 ```
-
-The workers automatically coordinate ranks through ETCD as they connect.
+The workers automatically coordinate ranks through ETCD as they connect. Note, the second nixlbench should be started within 60s, otherwise the first instance will stop with an error in the barrier.
 
 ### Backend-Specific Examples
 
@@ -562,9 +610,11 @@ The workers automatically coordinate ranks through ETCD as they connect.
 ```bash
 # Basic UCX benchmark
 ./nixlbench --etcd_endpoints http://etcd-server:2379 --backend UCX
+sleep 2 && ./nixlbench --etcd_endpoints http://etcd-server:2379 --backend UCX
 
 # UCX with specific devices
-./nixlbench --etcd_endpoints http://etcd-server:2379 --backend UCX --device_list mlx5_0,mlx5_1
+$ host1 > ./nixlbench --etcd_endpoints http://etcd-server:2379 --backend UCX --device_list mlx5_0,mlx5_1
+$ host2 > sleep 2 && ./nixlbench --etcd_endpoints http://etcd-server:2379 --backend UCX --device_list mlx5_0,mlx5_1
 ```
 
 **GPUNETIO Backend:**
@@ -658,7 +708,7 @@ GUSLI provides direct user-space access to block storage devices, supporting loc
 - `--gusli_client_name`: Client identifier (default: "NIXLBench")
 - `--gusli_max_simultaneous_requests`: Concurrent request limit (default: 32)
 - `--gusli_device_security`: Comma-separated security flags per device (default: "sec=0x3" for each device)
-- `--gusli_bdev_byte_offset`: Starting LBA offset in bytes (default: 1MB)
+- `--gusli_device_byte_offsets`: Comma-separated LBA offset in bytes per device (default: 1MB for each device)
 - `--gusli_config_file`: Custom config file content override
 
 **Notes**:
@@ -706,19 +756,63 @@ Transfer times are higher than local storage, so consider reducing iterations:
 - Test read operations: `--op_type READ`
 - Validate data consistency: `--check_consistency`
 
-### Multi-Node Coordination
-
-Launch multiple nixlbench instances pointing to the same ETCD server:
-
+### Azure Blob Storage Backend
+For AZURE_BLOB plugin benchmarking, ETCD is optional for single instances.
 ```bash
-# On host 1
-./nixlbench --etcd_endpoints http://etcd-server:2379 --backend UCX --initiator_seg_type VRAM --target_seg_type VRAM
+# Login using Azure CLI to access default azure credentials which is used by nixlbench and the backend
+az login
 
-# On host 2
-./nixlbench --etcd_endpoints http://etcd-server:2379 --backend UCX --initiator_seg_type VRAM --target_seg_type VRAM
+# Azure Blob benchmark using command line flags (no ETCD needed)
+./nixlbench --backend AZURE_BLOB \
+  --azure_blob_account_url <account_url> \
+  --azure_blob_container_name <container_name>
 ```
 
-The workers automatically coordinate ranks through ETCD as they connect.
+From the docker container, call the `az login` command prior to running `nixlbench`.
+```bash
+docker run -it \
+   --gpus all \
+   --network host nixlbench:latest \
+   bash -c "az login && nixlbench --backend AZURE_BLOB --azure_blob_account_url <account_url> --azure_blob_container_name <container_name>"
+```
+
+**Running against Azurite:**
+
+To run `nixlbench` against [Azurite](https://learn.microsoft.com/azure/storage/common/storage-use-azurite) for local testing,
+first start the Azurite server:
+```bash
+docker run --rm -p 10000:10000 mcr.microsoft.com/azure-storage/azurite azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck
+```
+And create an Azure Storage container to use for benchmarking:
+```bash
+# In a separate terminal, create an Azure Storage container in the running azurite instance
+az storage container create \
+  --name <container_name> \
+  --connection-string 'DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;'
+```
+
+Then run ``nixlbench`` with the following parameters:
+```bash
+./nixlbench --backend AZURE_BLOB \
+   --azure_blob_connection_string 'DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;' \
+   --azure_blob_container_name <container_name>
+```
+
+When running from the `nixlbench` docker container, you can omit use of the `az login` command prior to running `nixlbench`:
+```bash
+docker run -it \
+   --gpus all \
+   --network host nixlbench:latest \
+   nixlbench \
+   --backend AZURE_BLOB \
+   --azure_blob_connection_string 'DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;' \
+   --azure_blob_container_name <container_name>
+```
+
+
+**Testing Options:**
+- Test read operations: `--op_type READ`
+- Validate data consistency: `--check_consistency`
 
 ## Troubleshooting
 
@@ -812,6 +906,12 @@ ucx_info -d  # List UCX devices
 export UCX_LOG_LEVEL=DEBUG # Verbose UCX logging
 
 export UCX_PROTO_INFO=y # See transport used by UCX
+```
+
+#### ETCD Cleanup
+```bash
+# If a nixlbench instance failed you need to cleanup the etcd instance before starting nixlbench again
+ETCDCTL_API=3 etcdctl del "xferbench" --prefix=true
 ```
 
 ### Performance Tuning

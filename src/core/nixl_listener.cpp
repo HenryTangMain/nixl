@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,8 +17,8 @@
 
 #include <fcntl.h>
 #include "nixl.h"
+#include "common/configuration.h"
 #include "common/nixl_time.h"
-#include "common/str_tools.h"
 #include "agent_data.h"
 #include "common/nixl_log.h"
 #if HAVE_ETCD
@@ -27,6 +27,7 @@
 #include <future>
 #endif // HAVE_ETCD
 #include <absl/strings/str_format.h>
+#include <absl/strings/str_split.h>
 #include <poll.h>
 
 const std::string default_metadata_label = "metadata";
@@ -87,8 +88,15 @@ int connectToIP(std::string ip_addr, int port) {
     // Check if connection was successful
     int error = 0;
     socklen_t len = sizeof(error);
-    if (getsockopt(ret_fd, SOL_SOCKET, SO_ERROR, &error, &len) < 0 || error != 0) {
+    if (getsockopt(ret_fd, SOL_SOCKET, SO_ERROR, &error, &len) < 0) {
         NIXL_PERROR << "getsockopt failed for ip_addr: " << ip_addr << " and port: " << port;
+        close(ret_fd);
+        return -1;
+    }
+
+    if (error != 0) {
+        errno = error; // For the 'PERROR'.
+        NIXL_PERROR << "getsockopt gave error for ip_addr: " << ip_addr << " and port: " << port;
         close(ret_fd);
         return -1;
     }
@@ -186,11 +194,10 @@ recvCommMessage(int fd, std::string &msg) {
 class nixlEtcdClient {
 private:
     std::unique_ptr<etcd::SyncClient> etcd;
-    std::string namespace_prefix;
+    const std::string namespace_prefix;
     std::vector<std::string> invalidated_agents;
     std::mutex invalidated_agents_mutex;
-    std::unordered_map<std::string, std::unique_ptr<etcd::Watcher>,
-                        std::hash<std::string>, strEqual> agentWatchers;
+    std::unordered_map<std::string, std::unique_ptr<etcd::Watcher>> agentWatchers;
     std::chrono::microseconds watchTimeout_;
 
     // Helper function to create etcd key
@@ -202,13 +209,14 @@ private:
     }
 
 public:
-    nixlEtcdClient(const std::string &my_agent_name,
-                   const std::chrono::microseconds &timeout = std::chrono::microseconds(5000000))
-        : watchTimeout_(timeout) {
-        const char* etcd_endpoints = std::getenv("NIXL_ETCD_ENDPOINTS");
-        if (!etcd_endpoints || strlen(etcd_endpoints) == 0) {
-            throw std::runtime_error("No etcd endpoints provided");
-        }
+    explicit nixlEtcdClient(
+        const std::string &my_agent_name,
+        const std::chrono::microseconds &timeout = std::chrono::microseconds(5000000))
+        : namespace_prefix(
+              nixl::config::getValueDefaulted<std::string>("NIXL_ETCD_NAMESPACE",
+                                                           NIXL_ETCD_NAMESPACE_DEFAULT)),
+          watchTimeout_(timeout) {
+        const auto etcd_endpoints = nixl::config::getNonEmptyString("NIXL_ETCD_ENDPOINTS");
 
         try {
             etcd = std::make_unique<etcd::SyncClient>(etcd_endpoints);
@@ -218,10 +226,6 @@ public:
             return;
         }
         NIXL_DEBUG << "Created etcd client to endpoints: " << etcd_endpoints;
-
-        const char* etcd_namespace = std::getenv("NIXL_ETCD_NAMESPACE");
-        namespace_prefix = etcd_namespace ? etcd_namespace : NIXL_ETCD_NAMESPACE_DEFAULT;
-
         NIXL_DEBUG << "Using etcd namespace for agents: " << namespace_prefix;
 
         std::string agent_prefix = makeKey(my_agent_name, "");
@@ -307,7 +311,8 @@ public:
                            << " (rev " << response.value().modified_index() << ")";
                 return NIXL_SUCCESS;
             } else {
-                NIXL_ERROR << "Failed to fetch key: " << metadata_key << " from etcd: " << response.error_message();
+                NIXL_INFO << "Failed to fetch key: " << metadata_key
+                          << " from etcd: " << response.error_message();
                 return NIXL_ERR_NOT_FOUND;
             }
         }
@@ -408,8 +413,9 @@ public:
                 std::lock_guard<std::mutex> lock(invalidated_agents_mutex);
                 invalidated_agents.push_back(agent_name);
             } else {
-                NIXL_ERROR << "Watcher for " << event.kv().key() << " received unexpected event from etcd: "
-                           << event.event_type();
+                NIXL_ERROR << "Watcher for " << event.kv().key()
+                           << " received unexpected event from etcd: "
+                           << static_cast<int>(event.event_type());
             }
         };
 
@@ -455,7 +461,7 @@ nixlAgentData::commWorkerInternal(nixlAgent *myAgent) {
     std::unique_ptr<nixlEtcdClient> etcdClient = nullptr;
     // useEtcd is set in nixlAgent constructor and is true if NIXL_ETCD_ENDPOINTS is set
     if(useEtcd) {
-        etcdClient = std::make_unique<nixlEtcdClient>(name, config.etcdWatchTimeout);
+        etcdClient = std::make_unique<nixlEtcdClient>(name_, config_.etcdWatchTimeout);
     }
 #endif // HAVE_ETCD
 
@@ -465,7 +471,7 @@ nixlAgentData::commWorkerInternal(nixlAgent *myAgent) {
         // first, accept new connections
         int new_fd = 0;
 
-        while(new_fd != -1 && config.useListenThread) {
+        while (new_fd != -1 && config_.useListenThread) {
             new_fd = listener->acceptClient();
             nixl_socket_peer_t accepted_client;
 
@@ -508,8 +514,7 @@ nixlAgentData::commWorkerInternal(nixlAgent *myAgent) {
             nixl_socket_peer_t req_sock = std::make_pair(req_ip, req_port);
 
             // use remote IP for socket lookup
-            const auto client = remoteSockets.find(req_sock);
-            int client_fd;
+            auto client = remoteSockets.find(req_sock);
 
             // not connected
             if (req_command < SOCK_MAX) {
@@ -521,23 +526,40 @@ nixlAgentData::commWorkerInternal(nixlAgent *myAgent) {
                         continue;
                     }
                     remoteSockets[req_sock] = new_client;
-                    client_fd = new_client;
-                } else {
-                    client_fd = client->second;
+                    client = remoteSockets.find(req_sock);
                 }
             }
 
+            bool needs_disconnect = false;
             switch(req_command) {
             case SOCK_SEND: {
-                sendCommMessage(client_fd, "NIXLCOMM:LOAD" + my_MD);
+                try {
+                    sendCommMessage(client->second, "NIXLCOMM:LOAD" + my_MD);
+                }
+                catch (const std::runtime_error &e) {
+                    NIXL_ERROR << "Failed to send message to peer, disconnecting: " << e.what();
+                    needs_disconnect = true;
+                }
                 break;
             }
             case SOCK_FETCH: {
-                sendCommMessage(client_fd, "NIXLCOMM:SEND");
+                try {
+                    sendCommMessage(client->second, "NIXLCOMM:SEND");
+                }
+                catch (const std::runtime_error &e) {
+                    NIXL_ERROR << "Failed to send message to peer, disconnecting: " << e.what();
+                    needs_disconnect = true;
+                }
                 break;
             }
             case SOCK_INVAL: {
-                sendCommMessage(client_fd, "NIXLCOMM:INVL" + name);
+                try {
+                    sendCommMessage(client->second, "NIXLCOMM:INVL" + name_);
+                }
+                catch (const std::runtime_error &e) {
+                    NIXL_ERROR << "Failed to send message to peer, disconnecting: " << e.what();
+                    needs_disconnect = true;
+                }
                 break;
             }
 #if HAVE_ETCD
@@ -552,7 +574,8 @@ nixlAgentData::commWorkerInternal(nixlAgent *myAgent) {
                     const std::string &metadata_label = req_ip;
 
                     // Use local storeMetadataInEtcd function
-                    nixl_status_t ret = etcdClient->storeMetadataInEtcd(name, metadata_label, my_MD);
+                    const nixl_status_t ret =
+                        etcdClient->storeMetadataInEtcd(name_, metadata_label, my_MD);
                     if (ret != NIXL_SUCCESS) {
                         NIXL_ERROR << "Failed to store metadata in etcd: " << ret;
                     }
@@ -597,7 +620,7 @@ nixlAgentData::commWorkerInternal(nixlAgent *myAgent) {
                         throw std::runtime_error("ETCD is not enabled");
                     }
 
-                    nixl_status_t ret = etcdClient->removeMetadataFromEtcd(name);
+                    const nixl_status_t ret = etcdClient->removeMetadataFromEtcd(name_);
                     if (ret != NIXL_SUCCESS) {
                         NIXL_ERROR << "Failed to invalidate metadata in etcd: " << ret;
                     }
@@ -610,6 +633,10 @@ nixlAgentData::commWorkerInternal(nixlAgent *myAgent) {
                     break;
                 }
             }
+            if (needs_disconnect) {
+                close(client->second);
+                client = remoteSockets.erase(client);
+            }
         }
 
         // third, do remote commands
@@ -618,13 +645,25 @@ nixlAgentData::commWorkerInternal(nixlAgent *myAgent) {
             std::string commands;
             std::vector<std::string> command_list;
             nixl_status_t ret;
+            bool disconnected = false;
 
-            if (!recvCommMessage(socket_iter->second, commands)) {
-                socket_iter++;
+            try {
+                const bool received = recvCommMessage(socket_iter->second, commands);
+                if (!received) {
+                    // No message received, but without error condition.
+                    // Skip to the next peer
+                    socket_iter++;
+                    continue;
+                }
+            }
+            catch (const std::runtime_error &e) {
+                NIXL_ERROR << "Failed to receive message from peer, disconnecting: " << e.what();
+                close(socket_iter->second);
+                socket_iter = remoteSockets.erase(socket_iter);
                 continue;
             }
 
-            command_list = str_split_substr(commands, "NIXLCOMM:");
+            command_list = absl::StrSplit(commands, "NIXLCOMM:");
 
             for(const auto &command : command_list) {
 
@@ -648,7 +687,14 @@ nixlAgentData::commWorkerInternal(nixlAgent *myAgent) {
                     nixl_blob_t my_MD;
                     myAgent->getLocalMD(my_MD);
 
-                    sendCommMessage(socket_iter->second, std::string("NIXLCOMM:LOAD" + my_MD));
+                    try {
+                        sendCommMessage(socket_iter->second, std::string("NIXLCOMM:LOAD" + my_MD));
+                    }
+                    catch (const std::runtime_error &e) {
+                        NIXL_ERROR << "Failed to send message to peer, disconnecting: " << e.what();
+                        disconnected = true;
+                        break;
+                    }
                 } else if(header == "INVL") {
                     std::string remote_agent = command.substr(4);
                     myAgent->invalidateRemoteMD(remote_agent);
@@ -659,7 +705,12 @@ nixlAgentData::commWorkerInternal(nixlAgent *myAgent) {
                 }
             }
 
-            socket_iter++;
+            if (disconnected) {
+                close(socket_iter->second);
+                socket_iter = remoteSockets.erase(socket_iter);
+            } else {
+                socket_iter++;
+            }
         }
 
 #if HAVE_ETCD
@@ -669,7 +720,7 @@ nixlAgentData::commWorkerInternal(nixlAgent *myAgent) {
 #endif // HAVE_ETCD
 
         nixlTime::us_t start = nixlTime::getUs();
-        while( (start + config.lthrDelay) > nixlTime::getUs()) {
+        while ((start + config_.lthrDelay) > nixlTime::getUs()) {
             std::this_thread::yield();
         }
     }
@@ -680,12 +731,12 @@ void nixlAgentData::enqueueCommWork(nixl_comm_req_t request){
         NIXL_WARN << "Agent shutting down, unable to accept new requests";
         return;
     }
-    std::lock_guard<std::mutex> lock(commLock);
+    const std::lock_guard lock(commLock);
     commQueue.push_back(std::move(request));
 }
 
 void nixlAgentData::getCommWork(std::vector<nixl_comm_req_t> &req_list){
-    std::lock_guard<std::mutex> lock(commLock);
+    const std::lock_guard lock(commLock);
     req_list = std::move(commQueue);
     commQueue.clear();
 }
@@ -694,22 +745,24 @@ nixl_status_t
 nixlAgentData::loadConnInfo(const std::string &remote_name,
                             const nixl_backend_t &backend,
                             const nixl_blob_t &conn_info) {
-    if (backendEngines.count(backend) == 0) {
-        NIXL_DEBUG << "Agent " << name << " does not support a remote backend: " << backend;
+    if (backendEngines_.count(backend) == 0) {
+        NIXL_DEBUG << "Agent " << name_ << " does not support a remote backend: " << backend;
         return NIXL_ERR_NOT_SUPPORTED;
     }
 
     // No need to reload same conn info, error if it changed
-    if ((remoteBackends.count(remote_name) != 0) &&
-        (remoteBackends[remote_name].count(backend) != 0)) {
-        if (remoteBackends[remote_name][backend] != conn_info) {
-            return NIXL_ERR_NOT_ALLOWED;
+    const auto r_it = remoteBackends_.find(remote_name);
+    if (r_it != remoteBackends_.end()) {
+        const auto rb_it = r_it->second.find(backend);
+        if (rb_it != r_it->second.end()) {
+            if (rb_it->second != conn_info) {
+                return NIXL_ERR_NOT_ALLOWED;
+            }
+            return NIXL_SUCCESS;
         }
-
-        return NIXL_SUCCESS;
     }
 
-    nixlBackendEngine *eng = backendEngines[backend];
+    nixlBackendEngine *eng = backendEngines_[backend].get();
     if (!eng->supportsRemote()) {
         NIXL_DEBUG << backend << " does not support remote operations";
         return NIXL_ERR_NOT_SUPPORTED;
@@ -720,22 +773,18 @@ nixlAgentData::loadConnInfo(const std::string &remote_name,
         return ret;
     }
 
-    remoteBackends[remote_name].emplace(backend, conn_info);
+    remoteBackends_[remote_name].emplace(backend, conn_info);
     return NIXL_SUCCESS;
 }
 
 nixl_status_t
 nixlAgentData::loadRemoteSections(const std::string &remote_name, nixlSerDes &sd) {
-    if (remoteSections.count(remote_name) == 0) {
-        remoteSections[remote_name] = new nixlRemoteSection(remote_name);
-    }
-
-    const nixl_status_t ret = remoteSections[remote_name]->loadRemoteData(&sd, backendEngines);
+    const auto [it, inserted] = remoteSections_.try_emplace(remote_name, remote_name);
+    const nixl_status_t ret = it->second.loadRemoteData(&sd, backendEngines_);
     // TODO: can be more graceful, if just the new MD blob was improper
     if (ret != NIXL_SUCCESS) {
-        delete remoteSections[remote_name];
-        remoteSections.erase(remote_name);
-        remoteBackends.erase(remote_name);
+        remoteSections_.erase(it);
+        remoteBackends_.erase(remote_name);
         return ret;
     }
 
@@ -744,26 +793,23 @@ nixlAgentData::loadRemoteSections(const std::string &remote_name, nixlSerDes &sd
 
 nixl_status_t
 nixlAgentData::invalidateRemoteData(const std::string &remote_name) {
-    if (remote_name == name) {
-        NIXL_ERROR << "Agent " << name << " cannot invalidate itself";
+    if (remote_name == name_) {
+        NIXL_ERROR << "Agent " << name_ << " cannot invalidate itself";
         return NIXL_ERR_INVALID_PARAM;
     }
 
     nixl_status_t ret = NIXL_ERR_NOT_FOUND;
-    auto it_section = remoteSections.find(remote_name);
-    if (it_section != remoteSections.end()) {
-        delete it_section->second;
-        remoteSections.erase(it_section);
+    if (remoteSections_.erase(remote_name) > 0) {
         ret = NIXL_SUCCESS;
     }
 
-    auto it_backends = remoteBackends.find(remote_name);
-    if (it_backends != remoteBackends.end()) {
+    auto it_backends = remoteBackends_.find(remote_name);
+    if (it_backends != remoteBackends_.end()) {
         for (auto &it : it_backends->second) {
-            backendEngines[it.first]->disconnect(remote_name);
+            backendEngines_[it.first]->disconnect(remote_name);
         }
 
-        remoteBackends.erase(it_backends);
+        remoteBackends_.erase(it_backends);
         ret = NIXL_SUCCESS;
     }
 

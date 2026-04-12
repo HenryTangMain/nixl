@@ -34,7 +34,11 @@ sudo reboot
 If running on nvlink hosts like DGX we should also install fabric manager
 ```bash
 sudo apt install nvidia-fabricmanager-<version> # should be same as kernel version nvidia-fabricmanager-575
+sudo systemctl enable --now nvidia-fabricmanager
 ```
+
+**Important**: On NVSwitch-enabled systems (DGX A100, H100), `nvidia-fabricmanager` must be running before GPU initialization.
+Without it, CUDA will fail with "system not yet initialized" errors. Ensure the service is enabled at boot.
 
 Verify with `nvidia-smi`. Driver compatibility is critical for RDMA support[^1_1][^1_3].
 
@@ -137,7 +141,7 @@ sudo nvidia-ctk runtime configure --runtime=docker
 sudo systemctl restart docker
 ```
 
-Verify GPU access in containers using `docker run --gpus all nvcr.io/nvidia/cuda-dl-base:25.06-cuda12.9-devel-ubuntu24.04 nvidia-smi`[^1_3].
+Verify GPU access in containers using `docker run --gpus all nvcr.io/nvidia/cuda-dl-base:25.10-cuda13.0-devel-ubuntu24.04 nvidia-smi`[^1_3].
 
 ### 9. **Validation and Troubleshooting**
 

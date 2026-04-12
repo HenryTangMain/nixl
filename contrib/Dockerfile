@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,7 +14,7 @@
 # limitations under the License.
 
 ARG BASE_IMAGE="nvcr.io/nvidia/cuda-dl-base"
-ARG BASE_IMAGE_TAG="25.06-cuda12.9-devel-ubuntu24.04"
+ARG BASE_IMAGE_TAG="25.10-cuda13.0-devel-ubuntu24.04"
 ARG OS
 
 FROM ${BASE_IMAGE}:${BASE_IMAGE_TAG}
@@ -23,9 +23,12 @@ FROM ${BASE_IMAGE}:${BASE_IMAGE_TAG}
 ARG OS=${OS:-ubuntu24}
 ARG ARCH="x86_64"
 ARG DEFAULT_PYTHON_VERSION="3.12"
-ARG UCX_REF="v1.20.x"
+ARG UCX_REF="v1.21.x"
+ARG BUILD_NIXL_EP="true"
+ARG RDMA_CORE_PREFIX="/usr"
 ARG UCX_PREFIX="/usr"
 ARG UCX_PLUGIN_DIR="$UCX_PREFIX/lib/ucx"
+ARG DOCA_PREFIX="/opt/mellanox/doca"
 ARG NIXL_PREFIX="/usr/local/nixl"
 ARG NIXL_PLUGIN_DIR="$NIXL_PREFIX/lib/$ARCH-linux-gnu/plugins"
 ARG NPROC
@@ -33,6 +36,8 @@ ARG WHL_DEFAULT_PYTHON_VERSIONS="3.12"
 ARG LIBFABRIC_VERSION="v1.21.0"
 ARG LIBFABRIC_INSTALL_PATH="/usr/local"
 ARG BUILD_TYPE="release"
+ARG ABSL_TAG="lts_2025_08_14"
+ARG GRPC_TAG="v1.73.0"
 
 # Install build dependencies from Ubuntu repository
 RUN apt-get update -y && \
@@ -43,12 +48,9 @@ RUN apt-get update -y && \
     libclang-dev \
     cmake \
     libgflags-dev \
-    libgrpc-dev \
-    libgrpc++-dev \
     libprotobuf-dev \
     libaio-dev \
     liburing-dev \
-    protobuf-compiler-grpc \
     libcpprest-dev \
     etcd-server \
     etcd-client \
@@ -63,12 +65,16 @@ RUN apt-get update -y && \
     clang \
     hwloc \
     libhwloc-dev \
-    libcurl4-openssl-dev libssl-dev uuid-dev zlib1g-dev # aws-sdk-cpp dependencies
+    pkg-config \
+    # aws-sdk-cpp dependencies
+    libcurl4-openssl-dev libssl-dev uuid-dev zlib1g-dev \
+    # azure-sdk-for-cpp dependencies
+    libxml2-dev
 
 # Add DOCA repository and install packages
 RUN ARCH_SUFFIX=$(if [ "${ARCH}" = "aarch64" ]; then echo "arm64"; else echo "amd64"; fi) && \
     MELLANOX_OS="$(. /etc/lsb-release; echo ${DISTRIB_ID}${DISTRIB_RELEASE} | tr A-Z a-z | tr -d .)" && \
-    wget --tries=3 --waitretry=5 --no-verbose https://www.mellanox.com/downloads/DOCA/DOCA_v3.1.0/host/doca-host_3.1.0-091000-25.07-${MELLANOX_OS}_${ARCH_SUFFIX}.deb -O doca-host.deb && \
+    wget --tries=3 --waitretry=5 --no-verbose https://www.mellanox.com/downloads/DOCA/DOCA_v3.2.0/host/doca-host_3.2.0-125000-25.10-${MELLANOX_OS}_${ARCH_SUFFIX}.deb -O doca-host.deb && \
     dpkg -i doca-host.deb && \
     apt-get update && \
     apt-get upgrade -y && \
@@ -82,21 +88,73 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get -y install \
     libnuma-dev librdmacm-dev ibverbs-providers
 
 WORKDIR /workspace
+
+# Build Abseil from source (required for absl/log).
+RUN git clone https://github.com/abseil/abseil-cpp.git && \
+    cd abseil-cpp && \
+    git fetch --depth 1 origin ${ABSL_TAG} && \
+    git checkout ${ABSL_TAG} && \
+    mkdir -p build && cd build && \
+    cmake .. \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_SHARED_LIBS=ON \
+        -DABSL_PROPAGATE_CXX_STD=ON \
+        -DABSL_ENABLE_INSTALL=ON && \
+    make -j${NPROC:-$(nproc)} && \
+    make install && \
+    ldconfig
+
+# Build gRPC from source against system/install-prefix Abseil.
+RUN git clone --recurse-submodules -b ${GRPC_TAG} --depth 1 --shallow-submodules https://github.com/grpc/grpc && \
+    cd grpc && \
+    mkdir -p cmake/build && \
+    cd cmake/build && \
+    export CMAKE_PREFIX_PATH="/usr/local${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}" && \
+    export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:/usr/local/lib/${ARCH}-linux-gnu/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" && \
+    cmake ../.. \
+        -DgRPC_INSTALL=ON \
+        -DgRPC_BUILD_TESTS=OFF \
+        -DBUILD_SHARED_LIBS=ON \
+        -DCMAKE_CXX_STANDARD=17 \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DCMAKE_PREFIX_PATH=/usr/local \
+        -Dabsl_DIR=/usr/local/lib/cmake/absl \
+        -DgRPC_SSL_PROVIDER=package \
+        -DgRPC_ABSL_PROVIDER=package \
+        -DgRPC_PROTOBUF_PROVIDER=module \
+        -DgRPC_ZLIB_PROVIDER=package && \
+    make -j${NPROC:-$(nproc)} && \
+    make install && \
+    ldconfig
+
 RUN git clone --depth 1 https://github.com/etcd-cpp-apiv3/etcd-cpp-apiv3.git && \
     cd etcd-cpp-apiv3 && \
     sed -i '/^find_dependency(cpprestsdk)$/d' etcd-cpp-api-config.in.cmake && \
     mkdir build && cd build && \
-    cmake .. -DBUILD_ETCD_CORE_ONLY=ON -DCMAKE_BUILD_TYPE=Release && make -j${NPROC:-$(nproc)} && make install
+    cmake .. -DBUILD_ETCD_CORE_ONLY=ON -DCMAKE_BUILD_TYPE=Release -DETCD_CMAKE_CXX_STANDARD=17 -DCMAKE_PREFIX_PATH=/usr/local && \
+    make -j${NPROC:-$(nproc)} && make install
 
-RUN git clone --recurse-submodules --depth 1 --shallow-submodules https://github.com/aws/aws-sdk-cpp.git --branch 1.11.581 && \
+RUN git clone --recurse-submodules --depth 1 --shallow-submodules https://github.com/aws/aws-sdk-cpp.git --branch 1.11.760 && \
     mkdir aws_sdk_build && cd aws_sdk_build && \
-    cmake ../aws-sdk-cpp/ -DCMAKE_BUILD_TYPE=Release -DBUILD_ONLY="s3" -DENABLE_TESTING=OFF -DCMAKE_INSTALL_PREFIX=/usr/local && \
+    cmake ../aws-sdk-cpp/ -DCMAKE_BUILD_TYPE=Release -DBUILD_ONLY="s3;s3-crt" -DENABLE_TESTING=OFF -DCMAKE_INSTALL_PREFIX=/usr/local && \
     make -j${NPROC:-$(nproc)} && make install
 
 RUN git clone https://github.com/nvidia/gusli.git && \
      cd gusli && \
      make all BUILD_RELEASE=1 BUILD_FOR_UNITEST=0 VERBOSE=1 ALLOW_USE_URING=0 && \
      cd ..
+
+RUN git clone --depth 1 https://github.com/Azure/azure-sdk-for-cpp.git --branch azure-storage-blobs_12.15.0 && \
+    cd azure-sdk-for-cpp/ && \
+    mkdir build && cd build && \
+    AZURE_SDK_DISABLE_AUTO_VCPKG=1 cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DCMAKE_INSTALL_PREFIX=/usr/local -DDISABLE_AMQP=ON -DDISABLE_AZURE_CORE_OPENTELEMETRY=ON && \
+    cmake --build . --target azure-storage-blobs azure-identity && \
+    cmake --install sdk/core && \
+    cmake --install sdk/storage/azure-storage-common && \
+    cmake --install sdk/storage/azure-storage-blobs && \
+    cmake --install sdk/identity
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
@@ -121,9 +179,12 @@ RUN rm -rf /opt/hpcx/ucx
 
 RUN cd /usr/local/src && \
      git clone https://github.com/openucx/ucx.git && \
-     cd ucx && 			     \
-     git checkout $UCX_REF &&        \
-     ./autogen.sh && ./configure     \
+     cd ucx && \
+     echo "=== Using UCX_REF=$UCX_REF ===" && \
+     git checkout $UCX_REF && \
+     if [ "$BUILD_NIXL_EP" = "true" ]; then EXPERIMENTAL_API_PARAM="--enable-experimental-api"; else EXPERIMENTAL_API_PARAM=""; fi && \
+     ./autogen.sh && \
+     ./contrib/configure-release-mt  \
          --prefix=$UCX_PREFIX        \
          --enable-shared             \
          --disable-static            \
@@ -131,12 +192,12 @@ RUN cd /usr/local/src && \
          --enable-optimizations      \
          --enable-cma                \
          --enable-devel-headers      \
+         $EXPERIMENTAL_API_PARAM      \
          --with-cuda=/usr/local/cuda \
          --with-verbs                \
          --with-dm                   \
-         --with-gdrcopy=/usr/local   \
-         --with-efa                  \
-         --enable-mt &&              \
+         --without-gdrcopy           \
+         --with-efa  &&              \
      make -j${NPROC:-$(nproc)} &&                \
      make -j${NPROC:-$(nproc)} install-strip &&  \
      ldconfig
@@ -190,19 +251,31 @@ RUN uv pip install --upgrade meson meson-python pybind11 patchelf pyYAML click t
 # Install PyTorch
 RUN export UV_INDEX="https://download.pytorch.org/whl/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d .)" && \
     uv pip install torch torchvision torchaudio
+# Upgrade setuptools to latest version for compatibility with PEP 639 (license format)
+RUN uv pip install --upgrade 'setuptools>=80.9.0'
 
 WORKDIR /workspace/nixl
 COPY . /workspace/nixl
 
-ENV LD_LIBRARY_PATH=/usr/local/lib:$LIBFABRIC_INSTALL_PATH/lib:$LD_LIBRARY_PATH
+ENV LD_LIBRARY_PATH=/usr/local/lib:$LIBFABRIC_INSTALL_PATH/lib:$RDMA_CORE_PREFIX/lib:$LD_LIBRARY_PATH
 
 # Install pybind11 via apt
 RUN apt-get update && apt-get install -y --no-install-recommends pybind11-dev
 
+# Set PKG_CONFIG_PATH for NIXL EP dependencies (rdma-core, UCX, DOCA)
+ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/lib/$ARCH-linux-gnu/pkgconfig
+ENV PKG_CONFIG_PATH=$RDMA_CORE_PREFIX/lib/$ARCH-linux-gnu/pkgconfig:$UCX_PREFIX/lib/pkgconfig:$DOCA_PREFIX/lib/$ARCH-linux-gnu/pkgconfig:$PKG_CONFIG_PATH
+
 ENV NIXL_PREFIX=$NIXL_PREFIX
 RUN rm -rf build && \
     mkdir build && \
-    meson setup -Dlibfabric_path=$LIBFABRIC_INSTALL_PATH build/ --prefix=$NIXL_PREFIX --buildtype=$BUILD_TYPE && \
+    if [ "$BUILD_NIXL_EP" = "true" ]; then \
+        echo "=== BUILD_NIXL_EP=true: Building NIXL with NIXL EP support ===" && \
+        NIXL_EP_FLAG="-Dbuild_nixl_ep=true -Dbuild_examples=true"; \
+    else \
+        NIXL_EP_FLAG=""; \
+    fi && \
+    meson setup -Ducx_path=$UCX_PREFIX -Dlibfabric_path=$LIBFABRIC_INSTALL_PATH $NIXL_EP_FLAG build/ --prefix=$NIXL_PREFIX --buildtype=$BUILD_TYPE && \
     cd build && \
     ninja && \
     ninja install
@@ -211,17 +284,23 @@ RUN echo "$NIXL_PREFIX/lib/$ARCH-linux-gnu" > /etc/ld.so.conf.d/nixl.conf && \
     echo "$NIXL_PLUGIN_DIR" >> /etc/ld.so.conf.d/nixl.conf && \
     ldconfig
 
+# Set environment variables for NIXL EP
+ENV NIXL_PLUGIN_DIR=$NIXL_PLUGIN_DIR
+ENV PYTHONPATH=/workspace/nixl/build/examples/device/ep
+
 RUN cd src/bindings/rust && cargo build --release --locked
 
 # Build wheel using the build-wheel.sh script for better UCX plugin bundling and library management
 RUN export PATH=$VIRTUAL_ENV/bin:$PATH && \
     mkdir -p dist && \
+    if [ "$BUILD_NIXL_EP" = "true" ]; then EP_BUILD_FLAG="--build-nixl-ep"; else EP_BUILD_FLAG=""; fi && \
     ./contrib/build-wheel.sh \
     --python-version $DEFAULT_PYTHON_VERSION \
     --platform manylinux_2_39_$ARCH \
     --ucx-plugins-dir $UCX_PLUGIN_DIR \
     --nixl-plugins-dir $NIXL_PLUGIN_DIR \
-    --output-dir /workspace/nixl/dist
+    --output-dir /workspace/nixl/dist \
+    $EP_BUILD_FLAG
 
 RUN cp build/src/bindings/python/nixl-meta/nixl-*.whl dist/
 RUN uv pip install dist/nixl*cp${DEFAULT_PYTHON_VERSION//./}*.whl dist/nixl-*-none-any.whl

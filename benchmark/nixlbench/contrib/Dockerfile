@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,7 +14,7 @@
 # limitations under the License.
 
 ARG BASE_IMAGE="nvcr.io/nvidia/cuda-dl-base"
-ARG BASE_IMAGE_TAG="25.06-cuda12.9-devel-ubuntu24.04"
+ARG BASE_IMAGE_TAG="25.10-cuda13.0-devel-ubuntu24.04"
 
 # UCX argument is either "upstream" (default installed in base image) or "custom" (build from source)
 ARG UCX="upstream"
@@ -33,8 +33,6 @@ RUN apt-get update -y && \
     libclang-dev \
     cmake \
     libgflags-dev \
-    libgrpc-dev \
-    libgrpc++-dev \
     libprotobuf-dev \
     libaio-dev \
     liburing-dev \
@@ -55,7 +53,7 @@ RUN apt-get update -y && \
 # Add DOCA repository and install packages
 RUN ARCH_SUFFIX=$(if [ "${ARCH}" = "aarch64" ]; then echo "arm64"; else echo "amd64"; fi) && \
     MELLANOX_OS="$(. /etc/lsb-release; echo ${DISTRIB_ID}${DISTRIB_RELEASE} | tr A-Z a-z | tr -d .)" && \
-    wget --tries=3 --waitretry=5 --no-verbose https://www.mellanox.com/downloads/DOCA/DOCA_v3.1.0/host/doca-host_3.1.0-091000-25.07-${MELLANOX_OS}_${ARCH_SUFFIX}.deb -O doca-host.deb && \
+    wget --tries=3 --waitretry=5 --no-verbose https://www.mellanox.com/downloads/DOCA/DOCA_v3.2.0/host/doca-host_3.2.0-125000-25.10-${MELLANOX_OS}_${ARCH_SUFFIX}.deb -O doca-host.deb && \
     dpkg -i doca-host.deb && \
     apt-get update && \
     apt-get upgrade -y && \
@@ -71,6 +69,9 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get -y install \
 # Install AWS CLI
 RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-${ARCH}.zip" -o "awscliv2.zip" && \
     unzip awscliv2.zip && ./aws/install && rm -rf awscliv2.zip aws
+
+# Install Azure CLI
+RUN curl -sL https://aka.ms/InstallAzureCLIDeb | bash
 
 # --- Stage 2a: Represents using UCX from the base image ---
 FROM os_setup_stage AS ucx_upstream_image
@@ -97,6 +98,7 @@ RUN echo "INFO: Starting custom UCX build..." && \
     ./contrib/configure-release --with-cuda=/usr/local/cuda \
                                 $(if [ "$BUILD_TYPE" = "debug" ]; then echo "--enable-debug"; fi) \
                                 --enable-mt \
+                                --without-gdrcopy \
                                 --without-go && \
     make -j${NPROC:-$(nproc)} && \
     make install && \
@@ -116,8 +118,50 @@ ARG WHL_PLATFORM="manylinux_2_39_$ARCH"
 ARG BUILD_TYPE="release"
 ARG LIBFABRIC_VERSION="v1.21.0"
 ARG NPROC
+ARG ABSL_TAG="lts_2025_08_14"
+ARG GRPC_TAG="v1.73.0"
 
 WORKDIR /workspace
+
+# Build Abseil from source (required for absl/log).
+RUN git clone https://github.com/abseil/abseil-cpp.git && \
+    cd abseil-cpp && \
+    git fetch --depth 1 origin ${ABSL_TAG} && \
+    git checkout ${ABSL_TAG} && \
+    mkdir -p build && cd build && \
+    cmake .. \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_SHARED_LIBS=ON \
+        -DABSL_PROPAGATE_CXX_STD=ON \
+        -DABSL_ENABLE_INSTALL=ON && \
+    make -j${NPROC:-$(nproc)} && \
+    make install && \
+    ldconfig
+
+# Build gRPC from source against /usr/local Abseil.
+RUN git clone --recurse-submodules -b ${GRPC_TAG} --depth 1 --shallow-submodules https://github.com/grpc/grpc && \
+    cd grpc && \
+    mkdir -p cmake/build && \
+    cd cmake/build && \
+    export CMAKE_PREFIX_PATH="/usr/local${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}" && \
+    export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:/usr/local/lib/${ARCH}-linux-gnu/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" && \
+    cmake ../.. \
+        -DgRPC_INSTALL=ON \
+        -DgRPC_BUILD_TESTS=OFF \
+        -DBUILD_SHARED_LIBS=ON \
+        -DCMAKE_CXX_STANDARD=17 \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DCMAKE_PREFIX_PATH=/usr/local \
+        -Dabsl_DIR=/usr/local/lib/cmake/absl \
+        -DgRPC_SSL_PROVIDER=package \
+        -DgRPC_ABSL_PROVIDER=package \
+        -DgRPC_PROTOBUF_PROVIDER=module \
+        -DgRPC_ZLIB_PROVIDER=package && \
+    make -j${NPROC:-$(nproc)} && \
+    make install && \
+    ldconfig
 
 # Build libfabric from source
 RUN wget --tries=3 --waitretry=5 --timeout=30 --read-timeout=60 \
@@ -144,17 +188,30 @@ RUN git clone --depth 1 https://github.com/etcd-cpp-apiv3/etcd-cpp-apiv3.git && 
     cd etcd-cpp-apiv3 && \
     sed -i '/^find_dependency(cpprestsdk)$/d' etcd-cpp-api-config.in.cmake && \
     mkdir build && cd build && \
-    cmake .. -DBUILD_ETCD_CORE_ONLY=ON -DCMAKE_BUILD_TYPE=Release && make -j${NPROC:-$(nproc)} && make install
+    cmake .. -DBUILD_ETCD_CORE_ONLY=ON -DCMAKE_BUILD_TYPE=Release -DETCD_CMAKE_CXX_STANDARD=17 -DCMAKE_PREFIX_PATH=/usr/local && \
+    make -j${NPROC:-$(nproc)} && make install
 
 # Install AWS SDK C++ dependencies and build
 RUN apt-get update && apt-get install -y libcurl4-openssl-dev libssl-dev uuid-dev zlib1g-dev hwloc libhwloc-dev
 
-RUN git clone --recurse-submodules --depth 1 --shallow-submodules https://github.com/aws/aws-sdk-cpp.git --branch 1.11.581 && \
+RUN git clone --recurse-submodules --depth 1 --shallow-submodules https://github.com/aws/aws-sdk-cpp.git --branch 1.11.760 && \
     mkdir sdk_build && \
     cd sdk_build && \
-    cmake ../aws-sdk-cpp/ -DCMAKE_BUILD_TYPE=Release -DBUILD_ONLY="s3" -DENABLE_TESTING=OFF -DCMAKE_INSTALL_PREFIX=/usr/local && \
+    cmake ../aws-sdk-cpp/ -DCMAKE_BUILD_TYPE=Release -DBUILD_ONLY="s3;s3-crt" -DENABLE_TESTING=OFF -DCMAKE_INSTALL_PREFIX=/usr/local && \
     make -j && \
     make install
+
+# Install install Azure SDK for C++ dependencies and build
+RUN apt-get update && apt-get install -y libxml2-dev
+RUN git clone --depth 1 https://github.com/Azure/azure-sdk-for-cpp.git --branch azure-storage-blobs_12.15.0 && \
+    cd azure-sdk-for-cpp/ && \
+    mkdir build && cd build && \
+    AZURE_SDK_DISABLE_AUTO_VCPKG=1 cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DCMAKE_INSTALL_PREFIX=/usr/local -DDISABLE_AMQP=ON -DDISABLE_AZURE_CORE_OPENTELEMETRY=ON && \
+    cmake --build . --target azure-storage-blobs azure-identity && \
+    cmake --install sdk/core && \
+    cmake --install sdk/storage/azure-storage-common && \
+    cmake --install sdk/storage/azure-storage-blobs && \
+    cmake --install sdk/identity
 
 RUN git clone https://github.com/nvidia/gusli.git && \
     cd gusli && \
@@ -188,6 +245,8 @@ RUN uv pip install --upgrade meson meson-python pybind11 patchelf pyYAML click t
 RUN CUDA_SHORT_VERSION=cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d .) && \
     FLAGS="--index-url https://download.pytorch.org/whl/$CUDA_SHORT_VERSION" && \
     uv pip install $FLAGS torch torchvision torchaudio
+# Upgrade setuptools to latest version for compatibility with PEP 639 (license format)
+RUN uv pip install --upgrade 'setuptools>=80.9.0'
 
 COPY --from=nixl . /workspace/nixl
 COPY --from=nixlbench . /workspace/nixlbench

@@ -17,7 +17,7 @@ limitations under the License.
 
 # NIXL Backend Plugin Interface Overview
 
-NIXL (NVIDIA Inference Xfer Library) is designed to provide high bandwidth, low-latency communication for distributed inference workloads, such as efficient data transfers in scenarios like LLM serving. The library abstracts communication mechanisms and memory access across heterogeneous devices including CPUs, GPUs, and various storage types. This abstraction is presented to the user of NIXL library as its North Bound API (NB API), where they can express transfers requests to NIXL agent through its simple buffer list primitive, and after creation of a request, start the transfer in a non-blocking and asynchronous manner. NIXL delegates the transfer to the optimal backend plugin, resulting in seamless data movement at Speed of Light (SOL) across heterogeneous memory and storage systems.
+NIXL (NVIDIA Inference Xfer Library) is designed to provide high bandwidth, low-latency communication for distributed inference workloads, such as efficient data transfers in scenarios like LLM serving. The library abstracts communication mechanisms and memory access across heterogeneous devices including CPUs, GPUs, and various storage types. This abstraction is presented to the user of NIXL library as its North Bound API (NB API), where they can express transfer requests to NIXL agent through its simple buffer list primitive, and after creation of a request, start the transfer in a non-blocking and asynchronous manner. NIXL delegates the transfer to the optimal backend plugin, resulting in seamless data movement at Speed of Light (SOL) across heterogeneous memory and storage systems.
 
 This is achieved through the South Bound API (SB API) that serves as the standardized interface between NIXL's Transfer Agent and various backend plugins. NIXL agent handles bookkeeping for the local registered memories with backend plugins, as well as managing the required metadata for one-sided transfers, i.e., Read and Write operations, for local or remote transfers. The following diagram further illustrates these components:
 
@@ -102,14 +102,14 @@ Finally, note that a call to releaseXferReq should not block and be asynchronous
 * getNotifs(): Gets notifications received from remote agents (or local in case of loopback). The output is a map from remote agent name to a list (vector) of notifications, in the form of byte array.
 * genNotif(): Generates a notification to a remote agent, used for control or dummy notifications.
 
-Note that getNotif does not know which agent it should look for to receive the notification. So there should be a method to extract the agent name from the notification received, corresponding to a transfer. genNotif generates a notification which is not bound to any transfers, and does not provide any ordering guarantees. If a backend does not set supportsNotifications, these two methods are not needed.
+Note that getNotifs does not know which agent it should look for to receive the notification. So there should be a method to extract the agent name from the notification received, corresponding to a transfer. genNotif generates a notification which is not bound to any transfers, and does not provide any ordering guarantees. If a backend does not set supportsNotifications, these two methods are not needed.
 
 ## Descriptor List Abstraction
 
 A key underlying abstraction for NIXL library is a descriptor list, that is made of a memory space (host/GPU/block/File/Obj-Store) and a list of descriptors. There are 2 types of descriptors used for the SB API.
 
-*For transfers: (addr, len, devID, metadata), where metadata is a pointer to an nixlBackendMD object relevant to the registered memory that this descriptor falls within.
-*For registration, (addr, len, devID, str) where str is an optional byte-array for extra information. The table below shows the meaning of devID for different memory spaces, as well as optional meaning for File and Object-Store.
+* For transfers: (addr, len, devID, metadata), where metadata is a pointer to an nixlBackendMD object relevant to the registered memory that this descriptor falls within.
+* For registration, (addr, len, devID, str) where str is an optional byte-array for extra information. The table below shows the meaning of devID for different memory spaces, as well as optional meaning for File and Object-Store.
 
 | mem type | addr   | len  | devID         | str (byte-array)           |
 | -------- | ------ | ---- | ------------- | -------------------------- |
@@ -117,7 +117,7 @@ A key underlying abstraction for NIXL library is a descriptor list, that is made
 | VRAM     |        |      | GPU ID        |        -                   |
 | BLK      |        |      | Vol ID        |        -                   |
 | FILE     | offset | Or 0 | fd            | Path + (access mode)       |
-| DRAM     | offset | Or 0 | key           | Extended key (+ bucket ID) |
+| OBJ      | offset | Or 0 | key           | Extended key (+ bucket ID) |
 
 ## Plugin Manager API
 
@@ -165,7 +165,7 @@ In this step, if the plugin supports talking to remote agents, the required conn
 
 When a connection is requested to an remote agent, which is possible if the remote agent’s metadata is already loaded, the local Agent would look for common backend plugins between itself and the remote agent, and for each of them initiate a connect by using the **connect** API in SB API of such backends.
 
-### Register (Degister) memory with NIXL:
+### Register (Deregister) memory with NIXL:
 
 The agent will receive a list of allocated memories and desired backend from the user, and then will give only one element at a time to the specified backend. Note that backends usually require to register the memories they will access during transfers, and based on that registration keep some metadata for that memory region. For instance, in case of UCX, per each contiguous region of memory, it will produce some local metadata for that region. Agent will give only a single contiguous region of memory to the **register** call in SB API, and in return gets a key (a pointer) to the metadata that backend created for this memory region. Later on, during transfer, the agent will give the same key back to the backend, so backends do not need to do any bookkeeping of such metadata.
 

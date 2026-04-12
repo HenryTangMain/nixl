@@ -1,5 +1,5 @@
 #!/bin/bash
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -76,7 +76,9 @@ min_gtest_port=$((tcp_port_min + gtest_offset))
 max_gtest_port=$((tcp_port_max + gtest_offset))
 
 # Check if a GPU is present
-nvidia-smi -L | grep -q '^GPU' && HAS_GPU=true || HAS_GPU=false
+if [ -z "${HAS_GPU}" ]; then
+    nvidia-smi -L | grep -q '^GPU' && HAS_GPU=true || HAS_GPU=false
+fi
 
 # Ensure CUDA_HOME is set if CUDA is installed (cuda-dl-base images don't set it by default)
 if [ -d "/usr/local/cuda" ] && [ -z "$CUDA_HOME" ]; then
@@ -98,11 +100,12 @@ export TEST_LIBFABRIC=${TEST_LIBFABRIC:-false}
 # Set default parallelism for make/ninja (can be overridden by NPROC env var)
 if [ -z "$NPROC" ]; then
     # In containers, calculate based on memory limits to avoid OOM
-    if [[ -f /.dockerenv  ||  -f /run/.containerenv  ||  -n "${KUBERNETES_SERVICE_HOST}" ]]; then
+    if [ -f /.dockerenv ] || [ -f /run/.containerenv ] || [ -n "${KUBERNETES_SERVICE_HOST}" ]; then
         if [ -f /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
             limit=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes)
         elif [ -f /sys/fs/cgroup/memory.max ]; then
             limit=$(cat /sys/fs/cgroup/memory.max)
+            [ "$limit" = "max" ] && limit=$((4 * 1024 * 1024 * 1024))
         else
             limit=$((4 * 1024 * 1024 * 1024))
         fi
@@ -115,3 +118,39 @@ if [ -z "$NPROC" ]; then
     fi
     export NPROC=$nproc
 fi
+
+wait_for_etcd() {
+    local timeout=30
+    echo "Waiting for etcd to be ready (timeout: ${timeout}s)..."
+    while ! curl -s "${NIXL_ETCD_ENDPOINTS}/health" | grep -q 'true'; do
+        timeout=$((timeout - 1))
+        if [ $timeout -eq 0 ]; then
+            echo "Etcd failed to start"
+            exit 1
+        fi
+        sleep 1
+    done
+    echo "Etcd is ready"
+}
+
+start_etcd_server() {
+    local namespace_prefix=$1
+    if [ -z "${namespace_prefix}" ]; then
+        echo "Usage: start_etcd_server <namespace_prefix>"
+        exit 1
+    fi
+
+    echo "==== Running ETCD server ===="
+    etcd_port=$(get_next_tcp_port)
+    etcd_peer_port=$(get_next_tcp_port)
+    export NIXL_ETCD_ENDPOINTS="http://127.0.0.1:${etcd_port}"
+    export NIXL_ETCD_PEER_URLS="http://127.0.0.1:${etcd_peer_port}"
+    export NIXL_ETCD_NAMESPACE="${namespace_prefix}/${etcd_port}"
+
+    etcd --listen-client-urls "${NIXL_ETCD_ENDPOINTS}" --advertise-client-urls "${NIXL_ETCD_ENDPOINTS}" \
+         --listen-peer-urls "${NIXL_ETCD_PEER_URLS}" --initial-advertise-peer-urls "${NIXL_ETCD_PEER_URLS}" \
+         --initial-cluster "default=${NIXL_ETCD_PEER_URLS}" &
+    ETCD_PID=$!
+
+    wait_for_etcd
+}

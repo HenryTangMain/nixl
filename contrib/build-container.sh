@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,13 +29,14 @@ fi
 VERSION=v$latest_tag.dev.$commit_id
 
 BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base
-BASE_IMAGE_TAG=25.06-cuda12.9-devel-ubuntu24.04
+BASE_IMAGE_TAG=25.10-cuda13.0-devel-ubuntu24.04
 ARCH=$(uname -m)
 [ "$ARCH" = "arm64" ] && ARCH="aarch64"
 WHL_BASE=manylinux_2_39
 WHL_PLATFORM=${WHL_BASE}_${ARCH}
 WHL_PYTHON_VERSIONS="3.12"
-UCX_REF=${UCX_REF:-v1.20.x}
+UCX_REF=${UCX_REF:-v1.21.x}
+BUILD_NIXL_EP="true"
 OS="ubuntu24"
 NPROC=${NPROC:-$(nproc)}
 if [ "$CI" = "true" ]; then
@@ -122,6 +123,9 @@ get_options() {
             # Master branch (v1.20) also containing EFA SRD support
             UCX_REF=9d2b88a1f67faf9876f267658bd077b379b8bb76
             ;;
+        --build-nixl-ep)
+            BUILD_NIXL_EP=true
+            ;;
         --arch)
             if [ "$2" ]; then
                 ARCH=$2
@@ -148,7 +152,8 @@ get_options() {
     done
 
     if [[ $OS == "ubuntu22" ]]; then
-        BASE_IMAGE_TAG=24.10-cuda12.6-devel-ubuntu22.04
+        BASE_IMAGE=nvidia/cuda
+        BASE_IMAGE_TAG=13.0.1-devel-ubuntu22.04
         WHL_BASE=${WHL_BASE:-manylinux_2_34}
     fi
 
@@ -169,6 +174,11 @@ show_build_options() {
     echo "Python Versions for wheel build: ${WHL_PYTHON_VERSIONS}"
     echo "Wheel Platform: ${WHL_PLATFORM}"
     echo "UCX Ref: ${UCX_REF}"
+    if [ "$BUILD_NIXL_EP" = "true" ]; then
+        echo "NIXL EP: Enabled"
+    else
+        echo "NIXL EP: Disabled"
+    fi
     echo "Build Type: ${BUILD_TYPE}"
 }
 
@@ -183,6 +193,7 @@ show_help() {
     echo "  [--tag tag for image]"
     echo "  [--python-versions python versions to build for, comma separated]"
     echo "  [--ucx-upstream use ucx master branch]"
+    echo "  [--build-nixl-ep build NIXL with NIXL EP support (uses latest UCX master)]"
     echo "  [--arch [x86_64|aarch64] to select target architecture]"
     echo "  [--dockerfile path to a dockerfile to use]"
     exit 0
@@ -209,6 +220,7 @@ BUILD_ARGS+=" --build-arg WHL_PYTHON_VERSIONS=$WHL_PYTHON_VERSIONS"
 BUILD_ARGS+=" --build-arg WHL_PLATFORM=$WHL_PLATFORM"
 BUILD_ARGS+=" --build-arg ARCH=$ARCH"
 BUILD_ARGS+=" --build-arg UCX_REF=$UCX_REF"
+BUILD_ARGS+=" --build-arg BUILD_NIXL_EP=$BUILD_NIXL_EP"
 BUILD_ARGS+=" --build-arg NPROC=$NPROC"
 BUILD_ARGS+=" --build-arg OS=$OS"
 BUILD_ARGS+=" --build-arg BUILD_TYPE=$BUILD_TYPE"
